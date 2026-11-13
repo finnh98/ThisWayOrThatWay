@@ -1,0 +1,15 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const {Journey,distance,formatTime}=require('../tracker/core.js');
+const fix=(metres=0,timestamp=1000,accuracy=3)=>({lat:53.3146+metres/111195,lon:-6.274,accuracy,timestamp});
+const accept=(j,p,options={})=>j.accept(p,{now:p.timestamp,...options});
+test('timer excludes pauses and ends permanently',()=>{const j=new Journey();j.start(0);j.pause(5000);assert.equal(j.elapsed(20000),5000);j.resume(20000);j.end(23000);assert.equal(j.elapsed(99000),8000);assert.equal(formatTime(3661000),'01:01:01');});
+test('records threshold, ignores stationary jitter and poor accuracy',()=>{const j=new Journey();j.start(0);assert.ok(accept(j,fix()).accepted);assert.ok(!accept(j,fix(5,6000)).accepted);assert.ok(!accept(j,fix(20,10000,80)).accepted);assert.ok(accept(j,fix(12,12000)).accepted);assert.equal(j.points.length,2);assert.ok(j.metres>11&&j.metres<13);});
+test('standing still for a minute never adds a spurious point',()=>{const j=new Journey();j.start(0);for(let t=1000;t<70000;t+=1000)accept(j,fix(t%3,t));assert.equal(j.points.length,1);});
+test('uncertainty raises the minimum movement threshold',()=>{const j=new Journey();j.start(0);accept(j,fix(0,1000,15));assert.ok(!accept(j,fix(12,10000,15)).accepted);assert.ok(accept(j,fix(25,20000,15)).accepted);});
+test('pause does not record or join movement on resume',()=>{const j=new Journey();j.start(0);accept(j,fix());j.pause(1000);assert.ok(!accept(j,fix(200,2000)).accepted);j.resume(3000);accept(j,fix(200,4000));assert.equal(j.metres,0);assert.equal(j.points[1].segment,1);j.end(5000);assert.ok(!accept(j,fix(300,6000)).accepted);});
+test('new journey clears all previous state',()=>{const j=new Journey();j.start(0);accept(j,fix());accept(j,fix(15,10000));j.end(10000);j.start(20000);assert.equal(j.points.length,0);assert.equal(j.metres,0);assert.equal(j.elapsed(20000),0);});
+test('rejects stale fixes, duplicates, invalid coordinates and walking jumps',()=>{const j=new Journey();j.start(0);accept(j,fix());assert.ok(!accept(j,fix(10,1000)).accepted);assert.ok(!j.accept(fix(10,2000),{now:20000}).accepted);assert.ok(!accept(j,{...fix(10,3000),lat:200}).accepted);assert.ok(!accept(j,fix(500,4000)).accepted);assert.equal(j.points.length,1);});
+test('signal gap starts a segment without inventing distance',()=>{const j=new Journey();j.start(0);accept(j,fix());accept(j,fix(100,40000));assert.equal(j.metres,0);assert.equal(j.points[1].segment,1);});
+test('simulation bypasses walking speed filter but honours distance threshold',()=>{const j=new Journey();j.start(0);accept(j,fix());assert.ok(accept(j,fix(30,1200),{simulation:true}).accepted);assert.ok(!accept(j,fix(31,1400),{simulation:true}).accepted);});
+test('haversine returns zero at same point',()=>assert.equal(distance(fix(),fix()),0));
