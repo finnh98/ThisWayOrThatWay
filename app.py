@@ -1,4 +1,5 @@
 import time
+from copy import deepcopy
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -82,11 +83,22 @@ with st.sidebar:
         except ValueError:
             st.error("Waypoints must be formatted as: lat, lon (one per line).")
 
+        # Route edits reset playback before the controls are processed.
+        route_signature = tuple(route)
+        if st.session_state.get("route_signature") != route_signature:
+            st.session_state.route_signature = route_signature
+            st.session_state.sim_index = 0
+            st.session_state.progress_slider = 0
+            st.session_state.trail = []
+            st.session_state.playing = False
+
         c1, c2, c3 = st.columns(3)
-        if c1.button("▶ Play"):
+        if c1.button("▶ Play", disabled=not route):
             if st.session_state.sim_index >= len(route) - 1:
                 st.session_state.sim_index = 0
                 st.session_state.trail = []
+            st.session_state.progress_slider = st.session_state.sim_index
+            st.session_state.last_tick = time.monotonic()
             st.session_state.playing = True
         if c2.button("⏸ Pause"):
             st.session_state.playing = False
@@ -95,13 +107,20 @@ with st.sidebar:
             st.session_state.sim_index = 0
             st.session_state.trail = []
 
+# Keep GPS and simulated trails separate when switching mode.
+if st.session_state.get("previous_mode") != mode:
+    st.session_state.trail = []
+    st.session_state.playing = False
+    st.session_state.previous_mode = mode
+    st.session_state.pop("base_map_signature", None)
+
 # ---------- Get position ----------
 lat = lon = accuracy = speed = None
 
 if mode == "Live GPS":
     st.session_state.playing = False
     st.write("Press the button, then allow location access in your browser. Press again to refresh.")
-    loc = streamlit_geolocation()
+    loc = streamlit_geolocation() or {}
     lat, lon = loc.get("latitude"), loc.get("longitude")
     accuracy, speed = loc.get("accuracy"), loc.get("speed")
 
@@ -114,62 +133,79 @@ else:
         st.warning("Fix the waypoints in the sidebar to start the simulation.")
         st.stop()
 
-    idx = min(st.session_state.sim_index, len(route) - 1)
-    idx = st.slider("Route progress", 0, len(route) - 1, idx, key="progress_slider")
-    st.session_state.sim_index = idx
+# Build the base map only when its configuration changes. Moving objects are
+# sent separately so the browser keeps the same Leaflet map and viewport.
+base_signature = (mode, tiles, tuple(route))
+if st.session_state.get("base_map_signature") != base_signature:
+    center = route[0] if mode == "Simulation" else (lat, lon)
+    m = folium.Map(location=center, zoom_start=zoom, tiles=tiles)
+    if mode == "Simulation":
+        folium.PolyLine(route, color="gray", weight=3, opacity=0.6,
+                        dash_array="6").add_to(m)
+        folium.Marker(route[0], tooltip="Start",
+                      icon=folium.Icon(color="green", icon="play", prefix="fa")).add_to(m)
+        folium.Marker(route[-1], tooltip="End",
+                      icon=folium.Icon(color="blue", icon="flag", prefix="fa")).add_to(m)
+    st.session_state.base_map = m
+    st.session_state.base_map_signature = base_signature
 
-    lat, lon = route[idx]
-    accuracy = 10          # pretend 10 m accuracy
-    speed = 1.4            # pretend walking pace in m/s
-    st.caption(f"🧪 Simulation: step {idx + 1} of {len(route)}")
 
-# ---------- Update trail ----------
-point = (lat, lon)
-if not st.session_state.trail or st.session_state.trail[-1] != point:
-    st.session_state.trail.append(point)
+def seek_route():
+    st.session_state.sim_index = st.session_state.progress_slider
+    st.session_state.trail = []
+    st.session_state.last_tick = time.monotonic()
 
-# ---------- Stats ----------
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latitude", f"{lat:.6f}")
-c2.metric("Longitude", f"{lon:.6f}")
-c3.metric("Accuracy", f"{accuracy:.0f} m" if accuracy else "n/a")
-c4.metric("Speed", f"{speed * 3.6:.1f} km/h" if speed else "n/a")
 
-# ---------- Map ----------
-m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=tiles)
+# Sidebar actions cause a normal rerun; playback ticks rerun only this fragment.
+# Paused simulations keep a lightweight timer but never advance their position.
+@st.fragment(run_every=delay if mode == "Simulation" else None)
+def render_position():
+    current_lat, current_lon = lat, lon
+    current_accuracy, current_speed = accuracy, speed
+    if mode == "Simulation":
+        now = time.monotonic()
+        if st.session_state.playing and now - st.session_state.get("last_tick", now) >= delay:
+            st.session_state.sim_index = min(st.session_state.sim_index + 1, len(route) - 1)
+            st.session_state.last_tick = now
+        idx = min(st.session_state.sim_index, len(route) - 1)
+        # Set the widget state before instantiation, so timer and slider agree.
+        st.session_state.progress_slider = idx
+        st.slider("Route progress", 0, len(route) - 1,
+                  key="progress_slider", on_change=seek_route)
+        current_lat, current_lon = route[idx]
+        current_accuracy, current_speed = 10, 1.4
+        st.caption(f"🧪 Simulation: step {idx + 1} of {len(route)}")
+        if idx == len(route) - 1:
+            st.session_state.playing = False
+            st.success("Arrived at destination 🎉")
 
-if mode == "Simulation" and route:
-    # Planned route (dashed grey) plus start and end flags
-    folium.PolyLine(route, color="gray", weight=3, opacity=0.6, dash_array="6").add_to(m)
-    folium.Marker(route[0], tooltip="Start: Bijou, Rathgar Cross",
-                  icon=folium.Icon(color="green", icon="play", prefix="fa")).add_to(m)
-    folium.Marker(route[-1], tooltip="End: 32 Palmerston Road",
-                  icon=folium.Icon(color="blue", icon="flag", prefix="fa")).add_to(m)
+    point = (current_lat, current_lon)
+    if not st.session_state.trail or st.session_state.trail[-1] != point:
+        st.session_state.trail.append(point)
 
-folium.Marker(
-    [lat, lon],
-    tooltip="You are here",
-    popup=f"{lat:.6f}, {lon:.6f}",
-    icon=folium.Icon(color="red", icon="user", prefix="fa"),
-).add_to(m)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Latitude", f"{current_lat:.6f}")
+    c2.metric("Longitude", f"{current_lon:.6f}")
+    c3.metric("Accuracy", f"{current_accuracy:.0f} m" if current_accuracy is not None else "n/a")
+    c4.metric("Speed", f"{current_speed * 3.6:.1f} km/h" if current_speed is not None else "n/a")
 
-if show_accuracy and accuracy:
-    folium.Circle([lat, lon], radius=accuracy, color="#3388ff",
-                  fill=True, fill_opacity=0.15).add_to(m)
+    moving = folium.FeatureGroup(name="Current position and trail")
+    folium.Marker(point, tooltip="You are here",
+                  popup=f"{current_lat:.6f}, {current_lon:.6f}",
+                  icon=folium.Icon(color="red", icon="user", prefix="fa")).add_to(moving)
+    if show_accuracy and current_accuracy is not None:
+        folium.Circle(point, radius=current_accuracy, color="#3388ff",
+                      fill=True, fill_opacity=0.15).add_to(moving)
+    if show_trail and len(st.session_state.trail) > 1:
+        folium.PolyLine(st.session_state.trail, color="blue", weight=4,
+                        opacity=0.8).add_to(moving)
 
-if show_trail and len(st.session_state.trail) > 1:
-    folium.PolyLine(st.session_state.trail, color="blue", weight=4, opacity=0.8).add_to(m)
+    # streamlit-folium attaches the feature group to its Python map.
+    # Copy it so the stored base never accumulates moving layers.
+    st_folium(deepcopy(st.session_state.base_map), key="main_map", zoom=zoom,
+              feature_group_to_add=moving, height=550,
+              use_container_width=True, returned_objects=[])
+    st.caption(f"Trail points recorded: {len(st.session_state.trail)}")
 
-st_folium(m, height=550, use_container_width=True, returned_objects=[])
-st.caption(f"Trail points recorded: {len(st.session_state.trail)}")
 
-# ---------- Advance simulation ----------
-if mode == "Simulation" and st.session_state.playing:
-    if st.session_state.sim_index < len(route) - 1:
-        time.sleep(delay)
-        st.session_state.sim_index += 1
-        st.session_state.pop("progress_slider", None)  # let the slider follow the new index
-        st.rerun()
-    else:
-        st.session_state.playing = False
-        st.success("Arrived at 32 Palmerston Road 🎉")
+render_position()
